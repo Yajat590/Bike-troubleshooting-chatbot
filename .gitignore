@@ -1,0 +1,12 @@
+# Secrets — never commit this
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IMPORTANT: storage/ is intentionally NOT ignored.
+# The prebuilt per-bike indexes live there and MUST be committed,
+# otherwise the deployed app on Streamlit Cloud has no knowledge base.
