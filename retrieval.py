@@ -72,6 +72,12 @@ def load_retriever(bike_key: str):
 
 
 def retrieve_context(retriever, query: str) -> str:
-    """Run a hybrid search and return the matching manual text as one block."""
+    """Run a hybrid search and return the matching manual text as one block.
+
+    Each retrieved chunk is passed WHOLE — the detail that answers a question
+    often sits in the middle or end of a chunk (after a heading), so chunks
+    must not be trimmed. The prompt is kept bounded by TOP_K instead.
+    """
     hits = retriever.retrieve(query)
-    return "\n\n---\n\n".join(hit.node.get_content() for hit in hits)
+    return "\n\n---\n\n".join(hit.node.get_content().strip()
+                              for hit in hits if hit.node.get_content().strip())

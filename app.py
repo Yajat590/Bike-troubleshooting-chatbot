@@ -29,29 +29,25 @@ SHOW_RETRIEVAL_DEBUG = False
 # ---------------------------------------------------------------------------
 # The grounding + guardrail prompt.
 #
-# It opens and closes with a hard NO-THINKING directive: sarvam-30b is a
-# reasoning model and will narrate its deliberation if allowed. The prompt
-# describes the OUTPUT only — no procedural verbs ("analyze", "scan"), no
-# numbered checklist — so there is no process for the model to narrate.
+# Reasoning is disabled at the API level (reasoning_effort=None in
+# sarvam_llm.py), so the prompt no longer needs a /no_think directive. It
+# describes the OUTPUT only — no procedural verbs, no numbered checklist — and
+# explicitly asks for brief, succinct answers.
 #
 # The anti-stitching rule is critical for grounding: if a specific value is
 # missing from the excerpts, the model must say so rather than assembling a
 # fake spec out of unrelated nearby numbers.
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """/no_think
-Answer immediately and directly. Do NOT think out loud. Do NOT write any \
-analysis, planning, drafts, numbered reasoning, or phrases like "Let's try", \
-"Initial thought", or "Analyze the request". Output ONLY the final answer.
-
-You are a customer-facing troubleshooting assistant for the {bike} \
-motorcycle. You are talking directly to the bike's owner.
+SYSTEM_PROMPT = """You are a customer-facing troubleshooting assistant for \
+the {bike} motorcycle. You are talking directly to the bike's owner.
 
 You will be given excerpts from the official {bike} owner's manual. Base your \
 reply only on those excerpts and on the rules below.
 
+- Be brief and succinct. Give only what the owner needs — a few sentences or \
+2-4 short steps at most. No filler, no preamble.
 - If the excerpts answer the question: give a short, practical reply in \
-{reply_language} — a few sentences, or 2-4 brief steps. Plain, friendly \
-language an owner can act on.
+{reply_language}, in plain, friendly language an owner can act on.
 - If the excerpts do not cover the question: say in one or two sentences that \
 the manual does not cover this specific issue, mention the closest related \
 point if there is one, and suggest visiting an authorised {bike} service \
@@ -70,18 +66,16 @@ unrelated numbers found nearby. Instead, say the manual does not list that \
 specific value and suggest checking with an authorised {bike} service centre. \
 A wrong number is worse than no number.
 
-Write ONLY the final reply the owner should see — no analysis, no planning, \
-no step numbers, no notes about the manual. Speak directly, as if you simply \
-know the answer."""
+Write only the final reply the owner should see — no analysis, no planning, \
+no step numbers about your process, no notes about the manual. Speak directly \
+and concisely, as if you simply know the answer."""
 
 # ---------------------------------------------------------------------------
 # Language preprocessing — one Sarvam call that handles English, Devanagari
 # Hindi, AND Hinglish (Hindi typed in Roman letters).
 # ---------------------------------------------------------------------------
-PREPROCESS_PROMPT = """/no_think
-Answer directly with only the JSON described below — no analysis, no thinking.
-
-You are a language preprocessor for a motorcycle troubleshooting assistant.
+PREPROCESS_PROMPT = """You are a language preprocessor for a motorcycle \
+troubleshooting assistant. Be brief: reply with only the JSON described below.
 
 The user asked: "{question}"
 

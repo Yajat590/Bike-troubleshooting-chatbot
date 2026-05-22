@@ -19,8 +19,9 @@ class SarvamError(RuntimeError):
 
 
 # Phrases that only appear when sarvam-30b is "thinking out loud" — narrating
-# its deliberation instead of answering. If a reply is saturated with these,
-# the model leaked its reasoning into the answer and we must redo the call.
+# its deliberation instead of answering. Kept as a safety net: if reasoning is
+# correctly off these never fire, but if a reply ever leaks reasoning we catch
+# it and retry once.
 _THINKING_MARKERS = [
     "analyze the user", "scan the manual", "let's try", "let me try",
     "initial thought", "second thought", "drafting the response",
@@ -28,15 +29,6 @@ _THINKING_MARKERS = [
     "let me reconsider", "rule 1:", "rule 2:", "i'll go with",
     "let's go with", "final proposed answer", "let me re-evaluate",
 ]
-
-# A hard non-thinking instruction prepended on a retry. Sarvam's hybrid model
-# honours an explicit /no_think style directive in the message itself.
-_NO_THINK = (
-    "/no_think\n"
-    "Answer immediately and directly. Do NOT think out loud, do NOT plan, "
-    "do NOT write any analysis, drafts, or numbered reasoning. Output ONLY "
-    "the final short answer for the user.\n\n"
-)
 
 
 def _clean(text):
@@ -48,14 +40,9 @@ def _clean(text):
 
 
 def _looks_like_thinking(text: str) -> bool:
-    """True if the reply is the model narrating its reasoning, not answering.
-
-    We count how many distinct 'thinking' markers appear. A normal answer has
-    none. A leaked-reasoning reply has many, so 2+ is a reliable signal.
-    """
+    """True if the reply is the model narrating its reasoning, not answering."""
     low = text.lower()
-    hits = sum(1 for m in _THINKING_MARKERS if m in low)
-    return hits >= 2
+    return sum(1 for m in _THINKING_MARKERS if m in low) >= 2
 
 
 def _looks_repetitive(text: str) -> bool:
@@ -69,7 +56,7 @@ def _looks_repetitive(text: str) -> bool:
 
 def _post(messages, temperature, max_tokens, retries):
     """Single Sarvam request with network/rate-limit retries. Returns the
-    cleaned `content` string, or raises SarvamError."""
+    cleaned reply string, or raises SarvamError."""
     headers = {
         "Authorization": f"Bearer {SARVAM_API_KEY}",
         "Content-Type": "application/json",
@@ -79,10 +66,13 @@ def _post(messages, temperature, max_tokens, retries):
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        # sarvam-30b is a hybrid reasoning model on vLLM; this disables most
-        # of the thinking. The prompt-level /no_think directive handles the
-        # rest.
-        "chat_template_kwargs": {"enable_thinking": False},
+        # Disable the reasoning model's "thinking". reasoning_effort is the
+        # official Sarvam parameter; setting it to None (sent as JSON null)
+        # turns reasoning off, so the model answers directly.
+        "reasoning_effort": None,
+        # Discourage repetition loops without distorting normal answers.
+        "frequency_penalty": 0.3,
+        "presence_penalty": 0.3,
     }
 
     last_err = ""
@@ -125,9 +115,9 @@ def _post(messages, temperature, max_tokens, retries):
 def sarvam_chat(messages, temperature=0.0, max_tokens=4000, retries=4):
     """Send a chat-completion request to Sarvam and return the reply text.
 
-    If the model leaks its internal reasoning into the answer, this makes ONE
-    corrective retry with a hard no-think instruction. A degenerate repetition
-    loop fails cleanly.
+    Safety net: if the model ever leaks its internal reasoning into the
+    answer, this makes ONE corrective retry. A degenerate repetition loop
+    fails cleanly.
 
     Raises:
         SarvamError: on a missing key, a non-retryable error, or repeated
@@ -141,13 +131,14 @@ def sarvam_chat(messages, temperature=0.0, max_tokens=4000, retries=4):
 
     text = _post(messages, temperature, max_tokens, retries)
 
-    # If the model narrated its reasoning instead of answering, retry ONCE
-    # with a hard no-think directive injected into the first message.
+    # Safety net: if reasoning ever leaks through, retry once with an explicit
+    # instruction prepended. With reasoning_effort off this rarely fires.
     if _looks_like_thinking(text):
         retry_messages = [dict(m) for m in messages]
         for m in retry_messages:
             if m.get("role") in ("system", "user"):
-                m["content"] = _NO_THINK + m["content"]
+                m["content"] = ("Answer directly and briefly with only the "
+                                "final answer.\n\n" + m["content"])
                 break
         text = _post(retry_messages, temperature, max_tokens, retries)
 

@@ -34,7 +34,11 @@ CHUNK_SIZE = 512        # approx. tokens per chunk
 CHUNK_OVERLAP = 64      # token overlap so sentences are not cut mid-thought
 
 # --- Retrieval -------------------------------------------------------------
-TOP_K = 4              # how many chunks hybrid search feeds to the LLM
+# TOP_K = 5 is a balance: enough chunks that the genuinely relevant section is
+# reliably retrieved, but few enough that the prompt stays well within the
+# model's context. Each chunk is passed WHOLE — the useful detail often sits
+# in the middle/end of a chunk, so chunks must not be trimmed.
+TOP_K = 5               # how many whole chunks hybrid search feeds to the LLM
 
 # --- Embeddings (runs locally — free, no API key, nothing to rate-limit) ---
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
