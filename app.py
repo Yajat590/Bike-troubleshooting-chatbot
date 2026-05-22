@@ -22,22 +22,29 @@ from sarvam_llm import sarvam_chat, SarvamError
 st.set_page_config(page_title="Bike Troubleshooting Assistant",
                    page_icon="🏍️")
 
-# When True, every answer shows an expander with the exact manual excerpts
-# that were retrieved — useful for checking grounding while testing.
-# Set this to False before deploying for a clean public demo.
-SHOW_RETRIEVAL_DEBUG = True
+# Shows the retrieved manual excerpts under each answer. Useful while testing,
+# but OFF for delivery so the interviewer sees a clean interface.
+SHOW_RETRIEVAL_DEBUG = False
 
 # ---------------------------------------------------------------------------
-# The grounding + guardrail prompt — the heart of the "no hallucination,
-# no off-topic answers" behaviour.
+# The grounding + guardrail prompt.
 #
-# IMPORTANT: this prompt describes the OUTPUT, never a PROCESS. It contains no
-# verbs like "analyze", "review", or "scan the manual", and no numbered
-# checklist — a reasoning-off model will narrate any procedure it is given,
-# so we give it none. The closing line tells it to answer directly.
+# It opens and closes with a hard NO-THINKING directive: sarvam-30b is a
+# reasoning model and will narrate its deliberation if allowed. The prompt
+# describes the OUTPUT only — no procedural verbs ("analyze", "scan"), no
+# numbered checklist — so there is no process for the model to narrate.
+#
+# The anti-stitching rule is critical for grounding: if a specific value is
+# missing from the excerpts, the model must say so rather than assembling a
+# fake spec out of unrelated nearby numbers.
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """You are a customer-facing troubleshooting assistant for \
-the {bike} motorcycle. You are talking directly to the bike's owner.
+SYSTEM_PROMPT = """/no_think
+Answer immediately and directly. Do NOT think out loud. Do NOT write any \
+analysis, planning, drafts, numbered reasoning, or phrases like "Let's try", \
+"Initial thought", or "Analyze the request". Output ONLY the final answer.
+
+You are a customer-facing troubleshooting assistant for the {bike} \
+motorcycle. You are talking directly to the bike's owner.
 
 You will be given excerpts from the official {bike} owner's manual. Base your \
 reply only on those excerpts and on the rules below.
@@ -57,20 +64,24 @@ torque values, or steps that are not in the excerpts.
 - Quote figures, specifications, and units exactly as they appear in the \
 excerpts. Do not reformat, "correct", convert, or guess units even if a \
 value looks unusual, garbled, or incomplete.
+- If a specific value (such as a tyre pressure, torque, capacity, or gap) is \
+not clearly and completely stated in the excerpts, do NOT assemble one from \
+unrelated numbers found nearby. Instead, say the manual does not list that \
+specific value and suggest checking with an authorised {bike} service centre. \
+A wrong number is worse than no number.
 
-Write only the reply that the owner should see. Do not show any analysis, \
-planning, step numbers, rule numbers, or notes about the manual. Do not \
-mention "excerpts", "chunks", or "the manual says". Speak directly, as if \
-you simply know the answer."""
+Write ONLY the final reply the owner should see — no analysis, no planning, \
+no step numbers, no notes about the manual. Speak directly, as if you simply \
+know the answer."""
 
 # ---------------------------------------------------------------------------
 # Language preprocessing — one Sarvam call that handles English, Devanagari
-# Hindi, AND Hinglish (Hindi typed in Roman letters, the way people actually
-# type on WhatsApp). It returns the reply language plus a clean English query
-# for searching the English manuals.
+# Hindi, AND Hinglish (Hindi typed in Roman letters).
 # ---------------------------------------------------------------------------
-PREPROCESS_PROMPT = """You are a language preprocessor for a motorcycle \
-troubleshooting assistant.
+PREPROCESS_PROMPT = """/no_think
+Answer directly with only the JSON described below — no analysis, no thinking.
+
+You are a language preprocessor for a motorcycle troubleshooting assistant.
 
 The user asked: "{question}"
 
@@ -93,8 +104,6 @@ def preprocess(question: str):
     query used for manual search. Falls back safely if anything goes wrong.
     """
     try:
-        # Generous ceiling so the call cannot truncate. With thinking off
-        # this returns a tiny JSON object and bills only those few tokens.
         raw = sarvam_chat(
             [{"role": "user",
               "content": PREPROCESS_PROMPT.format(question=question)}],
@@ -106,8 +115,7 @@ def preprocess(question: str):
         english_query = (data.get("english_query") or question).strip()
     except (SarvamError, json.JSONDecodeError, AttributeError,
             KeyError, TypeError):
-        # Safe fallback: Devanagari script -> Hindi, otherwise English;
-        # search with the original question unchanged.
+        # Safe fallback: Devanagari script -> Hindi, otherwise English.
         language = ("hindi" if re.search(r"[\u0900-\u097F]", question)
                     else "english")
         english_query = question
@@ -129,8 +137,6 @@ def answer_question(bike_key: str, bike_name: str, question: str) -> str:
     reply_language, search_query = preprocess(question)
     context = retrieve_context(retriever, search_query)
 
-    # While testing, show exactly which manual chunks were retrieved so the
-    # grounding can be verified at a glance. Off for the public demo.
     if SHOW_RETRIEVAL_DEBUG:
         with st.expander("🔎 Manual excerpts used (debug)"):
             st.caption(f"Searched the {bike_name} index with: "
@@ -146,9 +152,8 @@ def answer_question(bike_key: str, bike_name: str, question: str) -> str:
             f"---\n{context}\n---\n\n"
             f"User question: {question}"},
     ]
-    # Generous ceiling (4000) so the answer can never be truncated. With
-    # thinking off a real answer is only a few hundred tokens; the ceiling
-    # is a safety net, and you are billed only for tokens actually used.
+    # 4000 is the answer ceiling (the Sarvam starter tier caps max_tokens at
+    # 4096). TOP_K is kept small in config.py so the prompt stays well within.
     return sarvam_chat(messages, temperature=0.0, max_tokens=4000)
 
 

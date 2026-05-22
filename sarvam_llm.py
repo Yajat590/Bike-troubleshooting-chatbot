@@ -18,58 +18,58 @@ class SarvamError(RuntimeError):
     """Raised when the Sarvam API cannot be reached or returns an error."""
 
 
+# Phrases that only appear when sarvam-30b is "thinking out loud" — narrating
+# its deliberation instead of answering. If a reply is saturated with these,
+# the model leaked its reasoning into the answer and we must redo the call.
+_THINKING_MARKERS = [
+    "analyze the user", "scan the manual", "let's try", "let me try",
+    "initial thought", "second thought", "drafting the response",
+    "final decision", "synthesize the answer", "let's re-read",
+    "let me reconsider", "rule 1:", "rule 2:", "i'll go with",
+    "let's go with", "final proposed answer", "let me re-evaluate",
+]
+
+# A hard non-thinking instruction prepended on a retry. Sarvam's hybrid model
+# honours an explicit /no_think style directive in the message itself.
+_NO_THINK = (
+    "/no_think\n"
+    "Answer immediately and directly. Do NOT think out loud, do NOT plan, "
+    "do NOT write any analysis, drafts, or numbered reasoning. Output ONLY "
+    "the final short answer for the user.\n\n"
+)
+
+
 def _clean(text):
-    """Strip any stray <think>...</think> reasoning block and surrounding
-    whitespace, so internal thinking can never reach the user even if a
-    block leaks through."""
+    """Strip any stray <think>...</think> block and surrounding whitespace."""
     if not text:
         return ""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return text.strip()
 
 
-def _looks_repetitive(text: str) -> bool:
-    """True if the answer is a degenerate repetition loop.
+def _looks_like_thinking(text: str) -> bool:
+    """True if the reply is the model narrating its reasoning, not answering.
 
-    A healthy answer is almost entirely unique phrasing; a loop (the model
-    repeating the same sentence dozens of times) has very few unique spans.
-    We slide a 6-word window over the text and measure how many spans are
-    unique — below 50% means the answer is broken.
+    We count how many distinct 'thinking' markers appear. A normal answer has
+    none. A leaked-reasoning reply has many, so 2+ is a reliable signal.
     """
+    low = text.lower()
+    hits = sum(1 for m in _THINKING_MARKERS if m in low)
+    return hits >= 2
+
+
+def _looks_repetitive(text: str) -> bool:
+    """True if the answer is a degenerate repetition loop."""
     words = text.split()
-    if len(words) <= 60:                       # too short to judge — allow it
+    if len(words) <= 60:
         return False
     spans = [" ".join(words[i:i + 6]) for i in range(len(words) - 6)]
     return bool(spans) and (len(set(spans)) / len(spans)) < 0.5
 
 
-def sarvam_chat(messages, temperature=0.2, max_tokens=4000, retries=4):
-    """Send a chat-completion request to Sarvam and return the reply text.
-
-    Args:
-        messages: list of {"role": "system"|"user"|"assistant", "content": str}
-        temperature: 0-2. Lower = more focused/deterministic.
-        max_tokens: ceiling on generated tokens. Kept generous on purpose —
-            see the note on the payload below.
-        retries: how many times to retry on network / rate-limit / server
-            errors. An empty or degenerate answer is deliberately NOT retried.
-
-    Returns:
-        The assistant's reply as a string.
-
-    Raises:
-        SarvamError: on a missing key, a non-retryable error, a degenerate
-        answer, or repeated failure.
-    """
-    if not SARVAM_API_KEY:
-        raise SarvamError(
-            "SARVAM_API_KEY is not set. Create a .env file in the project "
-            "root containing:  SARVAM_API_KEY=sk_your_key_here"
-        )
-
-    # The sk_xxx key works as a Bearer token (this matches Sarvam's official
-    # cURL example). If you ever see a 403, swap this header for:
-    #     "api-subscription-key": SARVAM_API_KEY
+def _post(messages, temperature, max_tokens, retries):
+    """Single Sarvam request with network/rate-limit retries. Returns the
+    cleaned `content` string, or raises SarvamError."""
     headers = {
         "Authorization": f"Bearer {SARVAM_API_KEY}",
         "Content-Type": "application/json",
@@ -79,18 +79,11 @@ def sarvam_chat(messages, temperature=0.2, max_tokens=4000, retries=4):
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        # --- Turning OFF the reasoning model's "thinking" ---
-        # sarvam-30b is a HYBRID think/non-think model served on vLLM.
-        # Sending reasoning_effort=null over raw HTTP does NOT disable
-        # thinking. The genuine switch exposed by vLLM is the chat-template
-        # flag `enable_thinking`, passed through here. With it false the
-        # model writes the answer straight into `content`.
+        # sarvam-30b is a hybrid reasoning model on vLLM; this disables most
+        # of the thinking. The prompt-level /no_think directive handles the
+        # rest.
         "chat_template_kwargs": {"enable_thinking": False},
     }
-    # NOTE on max_tokens: it is intentionally generous (4000). With thinking
-    # off a real answer is only a few hundred tokens, and you are billed for
-    # tokens actually generated — so the high ceiling costs nothing and just
-    # guarantees the answer can never be truncated.
 
     last_err = ""
     for attempt in range(retries):
@@ -99,47 +92,27 @@ def sarvam_chat(messages, temperature=0.2, max_tokens=4000, retries=4):
                                  json=payload, timeout=120)
         except requests.RequestException as exc:
             last_err = f"network error: {exc}"
-            time.sleep(2 ** attempt)          # 1s, 2s, 4s, 8s back-off
+            time.sleep(2 ** attempt)
             continue
 
         if resp.status_code == 200:
             data = resp.json()
             choice = data["choices"][0]
             message = choice.get("message", {}) or {}
-
-            # With thinking OFF the answer lands directly in `content`.
-            text = _clean(message.get("content"))
+            text = _clean(message.get("content")) \
+                or _clean(message.get("reasoning_content"))
             if text:
-                # Guard against a degenerate repetition loop (the model
-                # repeating one sentence many times). Fail cleanly rather
-                # than show the user a wall of repeated text. Retrying would
-                # only burn credits, so this raises immediately.
-                if _looks_repetitive(text):
-                    raise SarvamError(
-                        "Sarvam returned a repetitive answer. Please "
-                        "rephrase the question and try again."
-                    )
-                return text
-
-            # Empty `content` is NOT a transient error — retrying it just
-            # burns more credits for the same result. Try the reasoning
-            # field once as a last resort, then fail with a clear message.
-            text = _clean(message.get("reasoning_content"))
-            if text and not _looks_repetitive(text):
                 return text
             raise SarvamError(
                 "Sarvam returned an empty answer (finish_reason="
-                f"{choice.get('finish_reason')}). The answer was likely "
-                "truncated — raise max_tokens or check that thinking is off."
+                f"{choice.get('finish_reason')})."
             )
 
-        # 429 = rate limited, 5xx = transient server error -> wait and retry.
         if resp.status_code in (429, 500, 502, 503, 504):
             last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
             time.sleep(2 ** attempt)
             continue
 
-        # Anything else (e.g. 400 bad request, 403 auth) is not retryable.
         raise SarvamError(
             f"Sarvam API error {resp.status_code}: {resp.text[:300]}"
         )
@@ -147,3 +120,40 @@ def sarvam_chat(messages, temperature=0.2, max_tokens=4000, retries=4):
     raise SarvamError(
         f"Sarvam API failed after {retries} attempts. Last error: {last_err}"
     )
+
+
+def sarvam_chat(messages, temperature=0.0, max_tokens=4000, retries=4):
+    """Send a chat-completion request to Sarvam and return the reply text.
+
+    If the model leaks its internal reasoning into the answer, this makes ONE
+    corrective retry with a hard no-think instruction. A degenerate repetition
+    loop fails cleanly.
+
+    Raises:
+        SarvamError: on a missing key, a non-retryable error, or repeated
+        failure.
+    """
+    if not SARVAM_API_KEY:
+        raise SarvamError(
+            "SARVAM_API_KEY is not set. Create a .env file in the project "
+            "root containing:  SARVAM_API_KEY=sk_your_key_here"
+        )
+
+    text = _post(messages, temperature, max_tokens, retries)
+
+    # If the model narrated its reasoning instead of answering, retry ONCE
+    # with a hard no-think directive injected into the first message.
+    if _looks_like_thinking(text):
+        retry_messages = [dict(m) for m in messages]
+        for m in retry_messages:
+            if m.get("role") in ("system", "user"):
+                m["content"] = _NO_THINK + m["content"]
+                break
+        text = _post(retry_messages, temperature, max_tokens, retries)
+
+    if _looks_repetitive(text):
+        raise SarvamError(
+            "Sarvam returned a repetitive answer. Please rephrase the "
+            "question and try again."
+        )
+    return text
