@@ -50,6 +50,21 @@ SARVAM_API_URL = "https://api.sarvam.ai/v1/chat/completions"
 SARVAM_MODEL = "sarvam-m"              # faster, 24K context, 2048 max output
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "").strip()
 
+# On Streamlit Cloud the key comes through st.secrets, not through the
+# environment, so fall back to that if the env did not supply one. The
+# import is local so non-Streamlit callers (e.g. ingest.py run from the
+# CLI) don't pay the import cost or fail when no secrets.toml is present.
+if not SARVAM_API_KEY:
+    try:
+        import streamlit as st  # type: ignore
+        SARVAM_API_KEY = str(st.secrets.get("SARVAM_API_KEY", "")).strip()
+    except Exception:
+        # No streamlit installed, no secrets.toml, or any other failure —
+        # leave the key empty. The first API call will then surface a
+        # clear "SARVAM_API_KEY is not set" error rather than crashing
+        # at import time.
+        pass
+
 # Safety guard for the contextualisation step: caps the document text sent
 # with each chunk. All five manuals fit well inside sarvam-30b's 64K window,
 # so this only prevents a freakishly large file from erroring out.
