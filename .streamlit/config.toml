@@ -1,0 +1,13 @@
+# Streamlit configuration for the deployed app.
+#
+# fileWatcherType = "none" disables the local-source file watcher. We do
+# this because Streamlit's watcher walks every imported module's directory
+# to set up hot-reload — and `transformers` (pulled in transitively by
+# sentence-transformers) contains hundreds of vision-model submodules that
+# each import `torchvision` at module top. Since we only use a text
+# embedding model and never installed torchvision, the watcher logs a
+# noisy ModuleNotFoundError traceback for each one on every reload.
+# Hot-reload is useless on a deployed app anyway, so turning the watcher
+# off cleans up the logs without changing behaviour.
+[server]
+fileWatcherType = "none"
