@@ -81,3 +81,25 @@ def retrieve_context(retriever, query: str) -> str:
     hits = retriever.retrieve(query)
     return "\n\n---\n\n".join(hit.node.get_content().strip()
                               for hit in hits if hit.node.get_content().strip())
+
+
+def retrieve_context_multi(retriever, queries, max_chunks=None):
+    """Search with multiple queries, deduplicate by node ID, return top results."""
+    if max_chunks is None:
+        max_chunks = config.AGENTIC_MAX_CHUNKS
+
+    seen_ids = set()
+    all_hits = []
+    for query in queries:
+        for hit in retriever.retrieve(query):
+            nid = hit.node.node_id
+            if nid not in seen_ids:
+                seen_ids.add(nid)
+                all_hits.append(hit)
+
+    all_hits.sort(key=lambda h: h.score or 0, reverse=True)
+    all_hits = all_hits[:max_chunks]
+
+    return "\n\n---\n\n".join(hit.node.get_content().strip()
+                              for hit in all_hits
+                              if hit.node.get_content().strip())

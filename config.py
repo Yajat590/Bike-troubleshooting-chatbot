@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 # Loads SARVAM_API_KEY from a local .env file when running on your machine.
 # On Streamlit Cloud the key comes from the dashboard's Secrets instead;
 # either way it ends up in the environment, so the line below is harmless.
-load_dotenv()
+load_dotenv(override=True)
 
 # --- Paths -----------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
@@ -38,14 +38,16 @@ CHUNK_OVERLAP = 64      # token overlap so sentences are not cut mid-thought
 # reliably retrieved, but few enough that the prompt stays well within the
 # model's context. Each chunk is passed WHOLE — the useful detail often sits
 # in the middle/end of a chunk, so chunks must not be trimmed.
-TOP_K = 5               # how many whole chunks hybrid search feeds to the LLM
+TOP_K = 3               # how many whole chunks hybrid search feeds to the LLM
+AGENTIC_MAX_CHUNKS = 5  # max unique chunks across all agentic search queries
+MAX_CONTEXT_CHARS = 5000  # hard cap on manual text sent to the LLM
 
 # --- Embeddings (runs locally — free, no API key, nothing to rate-limit) ---
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # --- Sarvam LLM ------------------------------------------------------------
 SARVAM_API_URL = "https://api.sarvam.ai/v1/chat/completions"
-SARVAM_MODEL = "sarvam-30b"            # 64K context, free per token
+SARVAM_MODEL = "sarvam-m"              # faster, 24K context, 2048 max output
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "").strip()
 
 # Safety guard for the contextualisation step: caps the document text sent

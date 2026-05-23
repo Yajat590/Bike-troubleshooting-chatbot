@@ -16,8 +16,9 @@ import re
 import streamlit as st
 
 import config
-from retrieval import load_retriever, retrieve_context
-from sarvam_llm import sarvam_chat, SarvamError
+from retrieval import load_retriever, retrieve_context, retrieve_context_multi
+from sarvam_llm import sarvam_chat, sarvam_chat_stream, SarvamError
+from sarvam_stt import sarvam_transcribe
 
 st.set_page_config(page_title="Bike Troubleshooting Assistant",
                    page_icon="🏍️")
@@ -25,6 +26,26 @@ st.set_page_config(page_title="Bike Troubleshooting Assistant",
 # Shows the retrieved manual excerpts under each answer. Useful while testing,
 # but OFF for delivery so the interviewer sees a clean interface.
 SHOW_RETRIEVAL_DEBUG = False
+
+
+# ---------------------------------------------------------------------------
+# Eager startup: load embedding model + all bike indexes once on app boot.
+# Cached across reruns — only the very first page load pays the cost.
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner="Starting up — loading search engine...")
+def _preload_retrievers():
+    from retrieval import get_embed_model
+    get_embed_model()
+    retrievers = {}
+    for bike_key in config.BIKES:
+        try:
+            retrievers[bike_key] = load_retriever(bike_key)
+        except FileNotFoundError:
+            pass
+    return retrievers
+
+
+_RETRIEVERS = _preload_retrievers()
 
 # ---------------------------------------------------------------------------
 # The grounding + guardrail prompt.
@@ -38,106 +59,204 @@ SHOW_RETRIEVAL_DEBUG = False
 # missing from the excerpts, the model must say so rather than assembling a
 # fake spec out of unrelated nearby numbers.
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """You are a customer-facing troubleshooting assistant for \
-the {bike} motorcycle. You are talking directly to the bike's owner.
+SYSTEM_PROMPT = """You are a friendly mechanic helping the owner of a \
+{bike}. Talk like a knowledgeable friend — warm, direct, easy to follow.
 
-You will be given excerpts from the official {bike} owner's manual. Base your \
-reply only on those excerpts and on the rules below.
+You will receive excerpts from the {bike} owner's manual. Use ONLY those \
+excerpts. Reply in {reply_language}.
 
-- Be brief and succinct. Give only what the owner needs — a few sentences or \
-2-4 short steps at most. No filler, no preamble.
-- If the excerpts answer the question: give a short, practical reply in \
-{reply_language}, in plain, friendly language an owner can act on.
-- If the excerpts do not cover the question: say in one or two sentences that \
-the manual does not cover this specific issue, mention the closest related \
-point if there is one, and suggest visiting an authorised {bike} service \
-centre.
-- If the question is not about this motorcycle (sport, news, weather, general \
-chat, anything off-topic): reply with exactly one sentence saying you can \
-only help with {bike} troubleshooting and maintenance. Nothing more.
-- Never use outside knowledge. Never invent part names, specifications, \
-torque values, or steps that are not in the excerpts.
-- Quote figures, specifications, and units exactly as they appear in the \
-excerpts. Do not reformat, "correct", convert, or guess units even if a \
-value looks unusual, garbled, or incomplete.
-- If a specific value (such as a tyre pressure, torque, capacity, or gap) is \
-not clearly and completely stated in the excerpts, do NOT assemble one from \
-unrelated numbers found nearby. Instead, say the manual does not list that \
-specific value and suggest checking with an authorised {bike} service centre. \
-A wrong number is worse than no number.
+STYLE:
+- Start with what to do, not what might be wrong. Lead with the fix.
+- Use numbered steps (1, 2, 3) for any procedure. Keep each step to one \
+action.
+- Use exact values from the excerpts (pressures, torques, gaps). Never \
+round, convert, or guess.
+- If the excerpts mention multiple wheel types or variants, pick the one \
+that matches the {bike}. If unclear, state both clearly labelled.
+- Keep it short: 2-5 steps or 2-3 sentences max.
 
-Write only the final reply the owner should see — no analysis, no planning, \
-no step numbers about your process, no notes about the manual. Speak directly \
-and concisely, as if you simply know the answer."""
+BOUNDARIES:
+- If the excerpts don't answer the question: say so in one line and suggest \
+the nearest {bike} service centre.
+- Off-topic questions: one sentence — you only help with {bike} maintenance.
+- Never invent specs, part names, or steps not in the excerpts.
+- If a specific value is missing from the excerpts, say so — don't stitch \
+one together from nearby numbers."""
 
 # ---------------------------------------------------------------------------
 # Language preprocessing — one Sarvam call that handles English, Devanagari
 # Hindi, AND Hinglish (Hindi typed in Roman letters).
 # ---------------------------------------------------------------------------
-PREPROCESS_PROMPT = """You are a language preprocessor for a motorcycle \
-troubleshooting assistant. Be brief: reply with only the JSON described below.
+PREPROCESS_PROMPT = """Detect language and generate search queries. \
+Reply with ONLY JSON, nothing else.
 
-The user asked: "{question}"
+User asked: "{question}"
 
-Do two things:
-1. Decide the reply language. Use "hindi" if the question is in Hindi —
-   whether written in Devanagari script (for example "bike start nahi") OR in
-   Roman / Hinglish style (for example "bike start nahi ho rahi" or "engine se
-   awaaz aa rahi hai"). Use "english" only if it is plain English.
-2. Write a clean, plain-English version of the question, suitable for
-   searching an English manual.
+1. language: "hindi" if Hindi/Devanagari/Hinglish, else "english".
+2. english_query: clean English version for manual search.
+3. alt_queries: 2 alternative search phrases using manual headings, \
+synonyms, or technical terms.
 
-Reply with ONLY a JSON object and nothing else, exactly in this form:
-{{"language": "english" or "hindi", "english_query": "..."}}"""
+{{"language":"...","english_query":"...","alt_queries":["...","..."]}}"""
+
+RETRY_QUERY_PROMPT = """User asked about {bike}: "{question}"
+Manual search found no direct answer. Suggest 3 alternative search \
+phrases using different terms, manual section names, or broader/narrower \
+scope. Reply with ONLY a JSON array: ["phrase1","phrase2","phrase3"]"""
+
+# Strictly "I couldn't find this in the manual" phrases.
+# IMPORTANT: do NOT add generic "visit an authorised service centre" type
+# phrases here — they appear in perfectly good answers as routine follow-up
+# advice and would cause the retry to fire on a complete reply, producing
+# a duplicate second answer below the first.
+_INSUFFICIENT_MARKERS = [
+    "manual does not cover",
+    "manual doesn't cover",
+    "manual does not list",
+    "manual doesn't list",
+    "manual does not specify",
+    "manual doesn't specify",
+    "manual does not contain",
+    "manual doesn't contain",
+    "manual does not mention",
+    "manual doesn't mention",
+    "not mentioned in the manual",
+    "not found in the manual",
+    "not in the excerpts",
+    "no information in the manual",
+]
+
+
+def _is_hindi(question: str) -> bool:
+    """True if the question contains Devanagari or any Hinglish marker.
+
+    A single marker is enough \u2014 these words are rare in English but extremely
+    common in transliterated Hindi, so requiring two was causing short queries
+    like "bike start nahi" to be misclassified as English. Words that overlap
+    with everyday English (to, me, the, hi, on, in) are intentionally excluded.
+    """
+    if re.search(r"[\u0900-\u097F]", question):
+        return True
+    hinglish = {
+        # Negation / question words
+        "nahi", "nahin", "nai", "mat", "kyu", "kyun", "kya", "kaun",
+        "kab", "kahan", "kaise", "kaisa", "kaisi",
+        "kitna", "kitne", "kitni", "kiska", "kiski", "kiske",
+        # Postpositions / particles (skipping ambiguous "to", "me", "hi")
+        "ka", "ki", "ke", "ko", "se", "par", "tak", "mein", "bhi",
+        # "to be" forms — "the" is intentionally OMITTED. It is the Hindi
+        # past-tense plural ("they were"), but it is also the single most
+        # common word in English, so including it would misclassify almost
+        # every English query as Hindi.
+        "hai", "hain", "tha", "thi", "ho", "hoga", "hogi", "honge",
+        # Continuous-tense helpers
+        "raha", "rahi", "rahe", "rha", "rhi", "rhe",
+        # Common verbs
+        "karna", "karta", "karte", "karti", "kar", "kiya", "kare",
+        "hota", "hoti", "hote", "hua", "hui",
+        "aa", "aata", "aati", "aate", "aaya", "aayi", "aana",
+        "jana", "jaata", "jaati", "jaate", "gaya", "gayi",
+        "lagta", "lagti", "lagte", "laga", "lagi",
+        "chahiye", "chahta", "chahti",
+        "badalna", "badalta", "badalti", "badal",
+        "chal", "chalu", "chalna", "chalta", "chalti", "chalti",
+        "band", "chalu", "ruk", "rukna",
+        "dena", "deta", "deti", "diya", "dijiye",
+        "milna", "milta", "milti", "mila", "mili",
+        # Adjectives / descriptors
+        "thik", "theek", "sahi", "thoda", "thodi", "thode",
+        "puri", "pura", "khatam",
+        # Possessives
+        "mera", "meri", "mere", "tera", "teri", "tere",
+        # Descriptive / problem words
+        "awaaz", "awaz", "dhuan", "dhua", "dikkat", "garbar",
+        "garam", "thanda", "tezz", "tez", "dheere", "dhire",
+        "wala", "wali", "wale",
+    }
+    words = set(re.findall(r"\b[a-z]+\b", question.lower()))
+    return bool(words & hinglish)
 
 
 def preprocess(question: str):
-    """Return (reply_language, english_query).
+    """Return (reply_language, search_queries).
 
-    reply_language is "English" or "Hindi"; english_query is a clean English
-    query used for manual search. Falls back safely if anything goes wrong.
+    For plain English questions, skips the LLM call entirely and builds
+    search queries locally \u2014 saving ~2-3 seconds.
     """
+    is_hindi = _is_hindi(question)
+
+    if not is_hindi:
+        return "English", [question]
+
     try:
         raw = sarvam_chat(
             [{"role": "user",
               "content": PREPROCESS_PROMPT.format(question=question)}],
-            temperature=0.0, max_tokens=1500)
-        # Pull the JSON object out even if wrapped in code fences or text.
+            temperature=0.0, max_tokens=300)
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         data = json.loads(match.group(0))
-        language = str(data.get("language", "english")).strip().lower()
         english_query = (data.get("english_query") or question).strip()
+        alt_queries = data.get("alt_queries", [])
+        if not isinstance(alt_queries, list):
+            alt_queries = []
+        alt_queries = [q.strip() for q in alt_queries
+                       if isinstance(q, str) and q.strip()]
     except (SarvamError, json.JSONDecodeError, AttributeError,
             KeyError, TypeError):
-        # Safe fallback: Devanagari script -> Hindi, otherwise English.
-        language = ("hindi" if re.search(r"[\u0900-\u097F]", question)
-                    else "english")
         english_query = question
+        alt_queries = []
 
-    reply_language = "Hindi" if language == "hindi" else "English"
-    return reply_language, english_query
+    search_queries = [english_query] + alt_queries[:2]
+    return "Hindi", search_queries
 
 
-@st.cache_resource(show_spinner=False)
 def get_retriever(bike_key: str):
-    """Load and cache one bike's hybrid retriever (built once per session)."""
-    return load_retriever(bike_key)
+    """Look up the preloaded retriever, or load on demand as fallback."""
+    if bike_key in _RETRIEVERS:
+        return _RETRIEVERS[bike_key]
+    retriever = load_retriever(bike_key)
+    _RETRIEVERS[bike_key] = retriever
+    return retriever
 
 
-def answer_question(bike_key: str, bike_name: str, question: str) -> str:
-    """Retrieve from the manual and generate a grounded answer."""
-    retriever = get_retriever(bike_key)
+def _answer_seems_insufficient(answer: str) -> bool:
+    """True if the answer indicates the manual didn't have enough information.
 
-    reply_language, search_query = preprocess(question)
-    context = retrieve_context(retriever, search_query)
+    Two guards keep this strict:
+      1. Length cap — the system prompt instructs short (one-line) "couldn't
+         find" replies. Anything longer than ~250 chars is a real, substantive
+         answer that happens to mention a service centre as routine advice.
+      2. Marker list — only unambiguous "manual does/doesn't ..." phrases.
+    Without these guards, the retry path fires on complete answers and
+    appends a duplicate second answer below the first.
+    """
+    if len(answer) > 250:
+        return False
+    low = answer.lower()
+    return any(m in low for m in _INSUFFICIENT_MARKERS)
 
-    if SHOW_RETRIEVAL_DEBUG:
-        with st.expander("🔎 Manual excerpts used (debug)"):
-            st.caption(f"Searched the {bike_name} index with: "
-                       f"\"{search_query}\"")
-            st.text(context if context.strip() else "(no excerpts retrieved)")
 
-    messages = [
+def _generate_retry_queries(bike_name: str, question: str):
+    """Ask Sarvam for alternative search phrases when the first attempt missed."""
+    try:
+        raw = sarvam_chat(
+            [{"role": "user",
+              "content": RETRY_QUERY_PROMPT.format(bike=bike_name,
+                                                    question=question)}],
+            temperature=0.3, max_tokens=500)
+        match = re.search(r"\[.*\]", raw, re.DOTALL)
+        queries = json.loads(match.group(0))
+        return [q.strip() for q in queries
+                if isinstance(q, str) and q.strip()][:3]
+    except (SarvamError, json.JSONDecodeError, AttributeError, TypeError):
+        return []
+
+
+def _build_messages(bike_name, reply_language, context, question):
+    """Build the LLM messages list."""
+    if len(context) > config.MAX_CONTEXT_CHARS:
+        context = context[:config.MAX_CONTEXT_CHARS]
+    return [
         {"role": "system",
          "content": SYSTEM_PROMPT.format(bike=bike_name,
                                          reply_language=reply_language)},
@@ -146,9 +265,58 @@ def answer_question(bike_key: str, bike_name: str, question: str) -> str:
             f"---\n{context}\n---\n\n"
             f"User question: {question}"},
     ]
-    # 4000 is the answer ceiling (the Sarvam starter tier caps max_tokens at
-    # 4096). TOP_K is kept small in config.py so the prompt stays well within.
-    return sarvam_chat(messages, temperature=0.0, max_tokens=4000)
+
+
+def answer_question(bike_key: str, bike_name: str, question: str) -> str:
+    """Agentic retrieval: search with status, then stream the answer."""
+
+    # --- Steps 1-2: search (shown in status widget) ---
+    with st.status("Searching...", expanded=True, state="running") as status:
+
+        status.update(label="Step 1/2 — Understanding your question...",
+                      state="running")
+        reply_language, search_queries = preprocess(question)
+        if reply_language == "Hindi":
+            status.write("Detected Hindi/Hinglish — translated for search.")
+        status.write(f"Search queries: *{', '.join(search_queries)}*")
+
+        status.update(label="Step 2/2 — Searching the manual...",
+                      state="running")
+        retriever = get_retriever(bike_key)
+        context = retrieve_context_multi(retriever, search_queries)
+        chunk_count = context.count("---") + 1 if context.strip() else 0
+        status.write(f"Found {chunk_count} relevant sections.")
+
+        if SHOW_RETRIEVAL_DEBUG:
+            with st.expander("Manual excerpts (debug)"):
+                st.caption(f"Searched with: {search_queries}")
+                st.text(context if context.strip()
+                        else "(no excerpts retrieved)")
+
+        status.update(label="Search complete — streaming answer...",
+                      expanded=False, state="complete")
+
+    # --- Step 3: stream the answer directly into the chat bubble ---
+    messages = _build_messages(bike_name, reply_language, context, question)
+    reply = st.write_stream(sarvam_chat_stream(messages, max_tokens=500))
+
+    # --- Auto-retry if insufficient (non-streamed, rare with sarvam-m) ---
+    if _answer_seems_insufficient(reply):
+        retry_queries = _generate_retry_queries(bike_name, question)
+        if retry_queries:
+            extra_context = retrieve_context_multi(retriever, retry_queries)
+            if extra_context.strip():
+                combined = context + "\n\n---\n\n" + extra_context
+                msgs = _build_messages(bike_name, reply_language,
+                                       combined, question)
+                retry_reply = sarvam_chat(msgs, temperature=0.0,
+                                          max_tokens=500)
+                if not _answer_seems_insufficient(retry_reply):
+                    st.markdown("---")
+                    st.markdown(retry_reply)
+                    reply = retry_reply
+
+    return reply
 
 
 # ---------------------------------------------------------------------------
@@ -189,22 +357,52 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Handle a new question.
-question = st.chat_input(f"Ask about your {bike_name}...")
+# ---------------------------------------------------------------------------
+# Chat input with a built-in mic icon (Streamlit 1.56+).
+#
+# accept_audio=True puts a small recording button INSIDE the chat input
+# box — the same in-input voice UX ChatGPT / Claude / Gemini show. The
+# returned `prompt` is a dict-like object with two fields:
+#   prompt.text   — the typed message ("" if the user only recorded audio)
+#   prompt.audio  — an UploadedFile (WAV) if the user recorded, else None
+# We prefer typed text when both are provided; otherwise we send the WAV
+# bytes through Sarvam Speech-to-Text and treat the transcript exactly
+# like typed input. audio_sample_rate defaults to 16000 Hz — optimal for
+# speech recognition, as the Streamlit docs note.
+# ---------------------------------------------------------------------------
+# audio_sample_rate=24000 — a step above the 16 kHz default. Browser
+# WebRTC capture quality on repeated recordings can drift at 16 kHz
+# (auto-gain / echo cancel re-adapting); 24 kHz gives the STT model a
+# cleaner signal at a tiny file-size cost.
+prompt = st.chat_input(f"Ask about your {bike_name}...",
+                       accept_audio=True,
+                       audio_sample_rate=24000)
+
+question = None
+if prompt:
+    if prompt.text:
+        question = prompt.text
+    elif prompt.audio is not None:
+        with st.spinner("Transcribing your voice..."):
+            try:
+                question = sarvam_transcribe(prompt.audio.getvalue())
+            except SarvamError as exc:
+                st.error(str(exc))
+
 if question:
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("Checking the manual..."):
-            try:
-                reply = answer_question(bike_key, bike_name, question)
-            except FileNotFoundError as exc:
-                reply = (f"⚠️ {exc}\n\nThe search index for this bike is "
-                         f"missing. Run `python ingest.py` to build it.")
-            except SarvamError as exc:
-                reply = f"⚠️ Could not reach the Sarvam API.\n\n{exc}"
-        st.markdown(reply)
+        try:
+            reply = answer_question(bike_key, bike_name, question)
+        except FileNotFoundError as exc:
+            reply = (f"⚠️ {exc}\n\nThe search index for this bike is "
+                     f"missing. Run `python ingest.py` to build it.")
+            st.markdown(reply)
+        except SarvamError as exc:
+            reply = f"⚠️ Could not reach the Sarvam API.\n\n{exc}"
+            st.markdown(reply)
 
     st.session_state.messages.append({"role": "assistant", "content": reply})

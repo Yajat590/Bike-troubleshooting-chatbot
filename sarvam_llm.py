@@ -6,6 +6,7 @@ that can silently break.
 
 API reference: https://docs.sarvam.ai/api-reference-docs/chat/chat-completions
 """
+import json
 import re
 import time
 
@@ -148,3 +149,70 @@ def sarvam_chat(messages, temperature=0.0, max_tokens=4000, retries=4):
             "question and try again."
         )
     return text
+
+
+def sarvam_chat_stream(messages, temperature=0.0, max_tokens=2000):
+    """Yield text chunks via SSE streaming. Buffers any <think> blocks."""
+    if not SARVAM_API_KEY:
+        raise SarvamError(
+            "SARVAM_API_KEY is not set. Create a .env file in the project "
+            "root containing:  SARVAM_API_KEY=sk_your_key_here"
+        )
+
+    headers = {
+        "Authorization": f"Bearer {SARVAM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": SARVAM_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "reasoning_effort": None,
+        "frequency_penalty": 0.3,
+        "presence_penalty": 0.3,
+        "stream": True,
+    }
+
+    try:
+        resp = requests.post(SARVAM_API_URL, headers=headers,
+                             json=payload, timeout=120, stream=True)
+    except requests.RequestException as exc:
+        raise SarvamError(f"network error: {exc}")
+
+    if resp.status_code != 200:
+        raise SarvamError(
+            f"Sarvam API error {resp.status_code}: {resp.text[:300]}"
+        )
+
+    full_text = ""
+    yielded_up_to = 0
+
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data: "):
+            continue
+        data_str = line[6:]
+        if data_str.strip() == "[DONE]":
+            break
+        try:
+            data = json.loads(data_str)
+            delta = data["choices"][0].get("delta", {})
+            content = delta.get("content", "")
+            if not content:
+                continue
+            full_text += content
+            if "<think>" in full_text and "</think>" not in full_text:
+                continue
+            cleaned = re.sub(r"<think>.*?</think>", "", full_text,
+                             flags=re.DOTALL)
+            new_content = cleaned[yielded_up_to:]
+            if new_content:
+                yield new_content
+                yielded_up_to = len(cleaned)
+        except (json.JSONDecodeError, KeyError, IndexError):
+            continue
+
+    cleaned = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL)
+    remaining = cleaned[yielded_up_to:]
+    if remaining:
+        yield remaining
