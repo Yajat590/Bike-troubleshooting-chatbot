@@ -5,7 +5,7 @@ questions using **only** the official owner's manual of the selected bike — in
 English, Hindi, or Hinglish. It will not invent answers, will not use the open
 web, and will politely refuse anything off-topic.
 
-> **Live demo:** bike-chatbot-yj.streamlit.app  *(or: "Run locally — see Setup below.")*
+> **Live demo:** [bike-chatbot-yj.streamlit.app](https://bike-chatbot-yj.streamlit.app)
 
 ---
 
